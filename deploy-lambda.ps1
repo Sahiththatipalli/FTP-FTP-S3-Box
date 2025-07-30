@@ -28,10 +28,11 @@ if (-not $SourcePath) { $SourcePath = "." }
 # Make unique zip name for this run
 $zipGuid = [guid]::NewGuid().ToString().Substring(0, 8)
 $zipName = "$FunctionName-deploy-$zipGuid.zip"
-$zipFullPath = Join-Path $PWD $zipName
+$tempFolder = [System.IO.Path]::GetTempPath()
+$zipFullPath = Join-Path $tempFolder $zipName
 
 # Clean up previous zip files for this function (optional)
-Get-ChildItem "$FunctionName-deploy-*.zip" | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem "$tempFolder\$FunctionName-deploy-*.zip" | Remove-Item -Force -ErrorAction SilentlyContinue
 
 Write-Host "`nRefreshing AWS SSO session (if needed)..."
 aws sso login --profile $awsProfile
