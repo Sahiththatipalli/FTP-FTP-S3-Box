@@ -4,14 +4,16 @@ import boto3
 import paramiko
 import tempfile
 import shutil
-import time
-from boxsdk import JWTAuth, Client
+import logging
 import ftplib
+import time
+
+from boxsdk import JWTAuth, Client
 
 from logging_utils import (
     log_job_start, log_job_end, log_sftp_connection, log_matched_files,
-    log_checksum_ok, log_checksum_fail, log_file_transferred,
-    log_box_version, log_archive, log_tmp_usage, log_error, log_warning
+    log_checksum_ok, log_checksum_fail, log_file_transferred, log_archive,
+    log_tmp_usage, log_warning, log_error, log_box_version
 )
 from checksum_utils import log_checksum
 from trace_utils import get_or_create_trace_id
@@ -20,17 +22,23 @@ from retry_utils import default_retry
 from storage_utils import get_date_subpath, upload_files_to_box_by_date
 from performance_utils import time_operation
 from metrics_utils import publish_file_transfer_metric, publish_error_metric
-from alert_utils import send_transfer_alert
+from alert_utils import send_file_transfer_sns_alert
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logging.getLogger("boxsdk").setLevel(logging.WARNING)
 
 s3_client = boto3.client('s3')
 
 def get_secret(secret_name):
+    # Fetch secret from AWS Secrets Manager
     client = boto3.client('secretsmanager')
     response = client.get_secret_value(SecretId=secret_name)
     secret = response['SecretString']
     return json.loads(secret)
 
 def get_file_patterns():
+    # Get file patterns from environment or default to all files
     val = os.getenv('FILE_PATTERN')
     if val:
         return [x.strip() for x in val.split(',') if x.strip()]
@@ -38,72 +46,72 @@ def get_file_patterns():
 
 @default_retry()
 def create_sftp_client(host, port, username, password):
+    # Connect to SFTP server using Paramiko
     transport = paramiko.Transport((host, port))
     transport.connect(username=username, password=password)
     return paramiko.SFTPClient.from_transport(transport)
 
 @default_retry()
-def download_and_upload_to_s3(
-    sftp_client, remote_dir, bucket, prefix, local_dir,
-    trace_id, job_id, file_patterns, metrics_out, checksum_results
-):
+def download_and_upload_to_s3(sftp_client, remote_dir, bucket, prefix, local_dir, trace_id, job_id, file_patterns, metrics, transfer_status, checksum_status, errors, warnings):
+    # Download files from SFTP and upload to S3
     all_files = sftp_client.listdir(remote_dir)
     files = match_files(all_files, include_patterns=file_patterns)
     unmatched = set(all_files) - set(files)
     date_subpath = get_date_subpath()
     log_matched_files(trace_id, files, unmatched)
 
-    s3_total_bytes = 0
-    s3_total_time = 0
-    sftp_total_bytes = 0
-    sftp_total_time = 0
-
+    total_bytes = 0
+    t0 = time.time()
     for filename in files:
         remote_path = f"{remote_dir}/{filename}"
         local_path = os.path.join(local_dir, filename)
 
-        # Download from SFTP
-        t0 = time.time()
-        sftp_client.get(remote_path, local_path)
-        t1 = time.time()
-        sftp_download_time = t1 - t0
-        bytes_downloaded = os.path.getsize(local_path)
-        sftp_total_bytes += bytes_downloaded
-        sftp_total_time += sftp_download_time
+        _, duration = time_operation(sftp_client.get, remote_path, local_path)
+        bytes_transferred = os.path.getsize(local_path)
+        total_bytes += bytes_transferred
 
-        # Checksum after download
         downloaded_checksum = log_checksum(local_path, trace_id, algo="sha256", note="after SFTP download")
-        before_s3_checksum = log_checksum(local_path, trace_id, algo="sha256", note="before S3 upload")
+        s3_upload_checksum = log_checksum(local_path, trace_id, algo="sha256", note="before S3 upload")
 
-        if downloaded_checksum == before_s3_checksum:
-            checksum_results[filename] = f"OK (sha256: {downloaded_checksum})"
+        if downloaded_checksum == s3_upload_checksum:
             log_checksum_ok(trace_id, filename, downloaded_checksum)
+            checksum_status[filename] = f"OK (sha256: {downloaded_checksum})"
         else:
-            checksum_results[filename] = f"FAIL (after: {downloaded_checksum}, before_s3: {before_s3_checksum})"
-            log_checksum_fail(trace_id, filename, downloaded_checksum, before_s3_checksum)
+            log_checksum_fail(trace_id, filename, downloaded_checksum, s3_upload_checksum)
+            checksum_status[filename] = f"FAIL (downloaded: {downloaded_checksum}, s3: {s3_upload_checksum})"
 
-        # Upload to S3
         s3_key = f"{prefix}/{date_subpath}/{filename}" if prefix else f"{date_subpath}/{filename}"
-        t2 = time.time()
-        s3_client.upload_file(local_path, bucket, s3_key)
-        t3 = time.time()
-        s3_upload_time = t3 - t2
-        s3_total_bytes += bytes_downloaded
-        s3_total_time += s3_upload_time
-        log_file_transferred(trace_id, filename, "S3", s3_upload_time)
+        _, s3_duration = time_operation(s3_client.upload_file, local_path, bucket, s3_key)
+        log_file_transferred(trace_id, filename, "S3", s3_duration)
         log_archive(trace_id, filename, s3_key)
 
-    # Save metrics for S3 and SFTP
-    metrics_out["S3 upload speed mb/s"] = f"{(s3_total_bytes/1024/1024/s3_total_time):.2f}" if s3_total_time else "0.0"
-    metrics_out["SFTP download speed mb/s"] = f"{(sftp_total_bytes/1024/1024/sftp_total_time):.2f}" if sftp_total_time else "0.0"
-    metrics_out["S3 total mb"] = f"{s3_total_bytes/1024/1024:.2f}"
-    metrics_out["SFTP total mb"] = f"{sftp_total_bytes/1024/1024:.2f}"
+    t1 = time.time()
+    download_time = t1 - t0
+    mb = total_bytes / 1024 / 1024 if total_bytes else 0.0
+    mbps = (mb / download_time) if download_time else 0.0
+    metrics["S3 upload speed mb/s"] = f"{mbps:.2f}"
+    metrics["S3 total mb"] = f"{mb:.2f}"
+    metrics["SFTP download speed mb/s"] = f"{mbps:.2f}"
+    metrics["SFTP total mb"] = f"{mb:.2f}"
+
+    transfer_status["s3"] = f"SUCCESS ({', '.join(files)})" if files else "NO FILES"
+    try:
+        publish_file_transfer_metric(
+            namespace='LambdaFileTransfer',
+            direction='SFTP_TO_S3',
+            file_count=len(files),
+            total_bytes=total_bytes,
+            duration_sec=round(download_time,2),
+            trace_id=trace_id
+        )
+    except Exception as e:
+        log_error(trace_id, "CloudWatch metric error for S3 transfer", exc=e)
+        publish_error_metric('LambdaFileTransfer', 'S3MetricError', trace_id)
+        errors.append(str(e))
 
 @default_retry()
-def upload_files_to_external_ftp(
-    ftp_host, ftp_user, ftp_pass, remote_dir, local_dir,
-    trace_id, job_id, file_patterns, metrics_out
-):
+def upload_files_to_external_ftp(ftp_host, ftp_user, ftp_pass, remote_dir, local_dir, trace_id, job_id, file_patterns, metrics, transfer_status, checksum_status, errors, warnings):
+    # Upload files from local to external FTP
     files = match_files(os.listdir(local_dir), include_patterns=file_patterns)
     unmatched = set(os.listdir(local_dir)) - set(files)
     date_subpath = get_date_subpath()
@@ -121,26 +129,41 @@ def upload_files_to_external_ftp(
             pass
         ftp.cwd(part)
 
-    ftp_total_bytes = 0
-    ftp_total_time = 0
-
+    total_bytes = 0
+    t0 = time.time()
     for filename in files:
         local_path = os.path.join(local_dir, filename)
-        before_ftp_checksum = log_checksum(local_path, trace_id, algo="sha256", note="before FTP upload")
+        ftp_upload_checksum = log_checksum(local_path, trace_id, algo="sha256", note="before FTP upload")
 
         with open(local_path, 'rb') as f:
-            t0 = time.time()
-            ftp.storbinary(f'STOR {filename}', f)
-            t1 = time.time()
-            bytes_uploaded = os.path.getsize(local_path)
-            ftp_total_bytes += bytes_uploaded
-            ftp_total_time += (t1 - t0)
-            log_file_transferred(trace_id, filename, "FTP", t1 - t0)
-    ftp.quit()
+            _, ftp_duration = time_operation(ftp.storbinary, f'STOR {filename}', f)
+            bytes_transferred = os.path.getsize(local_path)
+            total_bytes += bytes_transferred
+            log_file_transferred(trace_id, filename, "FTP", ftp_duration)
+        checksum_status[filename] = f"OK (sha256: {ftp_upload_checksum})"
 
-    # Save metrics
-    metrics_out["FTP upload speed mb/s"] = f"{(ftp_total_bytes/1024/1024/ftp_total_time):.2f}" if ftp_total_time else "0.0"
-    metrics_out["FTP total mb"] = f"{ftp_total_bytes/1024/1024:.2f}"
+    t1 = time.time()
+    ftp.quit()
+    upload_time = t1 - t0
+    mb = total_bytes / 1024 / 1024 if total_bytes else 0.0
+    mbps = (mb / upload_time) if upload_time else 0.0
+    metrics["FTP upload speed mb/s"] = f"{mbps:.2f}"
+    metrics["FTP total mb"] = f"{mb:.2f}"
+
+    transfer_status["ftp"] = f"SUCCESS ({', '.join(files)})" if files else "NO FILES"
+    try:
+        publish_file_transfer_metric(
+            namespace='LambdaFileTransfer',
+            direction='LOCAL_TO_FTP',
+            file_count=len(files),
+            total_bytes=total_bytes,
+            duration_sec=round(upload_time,2),
+            trace_id=trace_id
+        )
+    except Exception as e:
+        log_error(trace_id, "CloudWatch metric error for FTP transfer", exc=e)
+        publish_error_metric('LambdaFileTransfer', 'FtpMetricError', trace_id)
+        errors.append(str(e))
 
 def lambda_handler(event, context):
     trace_id = get_or_create_trace_id(context)
@@ -148,14 +171,15 @@ def lambda_handler(event, context):
     file_patterns = get_file_patterns()
     log_job_start(trace_id, job_id, file_patterns)
 
-    sns_topic_arn = os.environ.get("SNS_TOPIC_ARN")
-
     src_secret_name = os.getenv('SRC_SECRET_NAME')
     ext_secret_name = os.getenv('EXT_SECRET_NAME')
     box_secret_name = os.getenv('BOX_SECRET_NAME')
     box_folder_id = os.getenv('BOX_FOLDER_ID')
+
     s3_bucket = os.getenv('S3_BUCKET', 'jams-ftp-process-bucket')
     s3_prefix = os.getenv('S3_PREFIX', 'ftp-ftp-list')
+    sns_topic_arn = os.getenv("SNS_TOPIC_ARN")
+    function_name = os.getenv('AWS_LAMBDA_FUNCTION_NAME', 'N/A')
 
     src_secret = get_secret(src_secret_name)
     src_host = src_secret['Host']
@@ -180,9 +204,10 @@ def lambda_handler(event, context):
     )
     box_client = Client(auth)
 
-    transfer_status = {}
-    checksum_results = {}
+    # Dicts for metrics and results
     metrics = {}
+    transfer_status = {}
+    checksum_status = {}
     errors = []
     warnings = []
 
@@ -190,36 +215,30 @@ def lambda_handler(event, context):
         free_mb = shutil.disk_usage(tmp_dir).free // (1024 * 1024)
         log_tmp_usage(trace_id, len(os.listdir(tmp_dir)), free_mb)
 
-        try:
-            src_sftp = create_sftp_client(src_host, 22, src_user, src_pass)
-            log_sftp_connection(trace_id, src_host, "OPENED")
-            download_and_upload_to_s3(
-                src_sftp, src_dir, s3_bucket, s3_prefix, tmp_dir, trace_id,
-                job_id, file_patterns, metrics, checksum_results
-            )
-            src_sftp.close()
-            log_sftp_connection(trace_id, src_host, "CLOSED")
-            transfer_status["s3"] = f"SUCCESS ({', '.join(list(checksum_results.keys()))})"
-        except Exception as e:
-            errors.append(f"S3/Download failed: {e}")
-            transfer_status["s3"] = f"FAILED ({e})"
+        src_sftp = create_sftp_client(src_host, 22, src_user, src_pass)
+        log_sftp_connection(trace_id, src_host, "OPENED")
+
+        # SFTP -> S3
+        download_and_upload_to_s3(
+            src_sftp, src_dir, s3_bucket, s3_prefix, tmp_dir, trace_id, job_id,
+            file_patterns, metrics, transfer_status, checksum_status, errors, warnings
+        )
+        src_sftp.close()
+        log_sftp_connection(trace_id, src_host, "CLOSED")
 
         free_mb = shutil.disk_usage(tmp_dir).free // (1024 * 1024)
         log_tmp_usage(trace_id, len(os.listdir(tmp_dir)), free_mb)
 
-        try:
-            upload_files_to_external_ftp(
-                external_ftp_host, external_ftp_user, external_ftp_pass,
-                external_ftp_dir, tmp_dir, trace_id, job_id, file_patterns, metrics
-            )
-            transfer_status["ftp"] = f"SUCCESS ({', '.join(list(checksum_results.keys()))})"
-        except Exception as e:
-            errors.append(f"FTP upload failed: {e}")
-            transfer_status["ftp"] = f"FAILED ({e})"
+        # Local -> FTP
+        upload_files_to_external_ftp(
+            external_ftp_host, external_ftp_user, external_ftp_pass, external_ftp_dir,
+            tmp_dir, trace_id, job_id, file_patterns, metrics, transfer_status, checksum_status, errors, warnings
+        )
 
         free_mb = shutil.disk_usage(tmp_dir).free // (1024 * 1024)
         log_tmp_usage(trace_id, len(os.listdir(tmp_dir)), free_mb)
 
+        # Local -> Box
         box_files = match_files(os.listdir(tmp_dir), include_patterns=file_patterns)
         unmatched = set(os.listdir(tmp_dir)) - set(box_files)
         log_matched_files(trace_id, box_files, unmatched)
@@ -229,16 +248,19 @@ def lambda_handler(event, context):
                 os.makedirs(box_tmp_dir, exist_ok=True)
                 for fname in box_files:
                     shutil.copy2(os.path.join(tmp_dir, fname), os.path.join(box_tmp_dir, fname))
+                box_total_bytes = sum(os.path.getsize(os.path.join(box_tmp_dir, f)) for f in box_files)
                 t0 = time.time()
                 upload_files_to_box_by_date(box_client, box_folder_id, box_tmp_dir, context)
                 t1 = time.time()
                 box_upload_time = t1 - t0
-                box_total_bytes = sum(os.path.getsize(os.path.join(box_tmp_dir, f)) for f in box_files)
-                metrics["Box upload speed mb/s"] = f"{(box_total_bytes/1024/1024/box_upload_time):.2f}" if box_upload_time else "0.0"
-                metrics["Box total mb"] = f"{box_total_bytes/1024/1024:.2f}"
+                box_mb = box_total_bytes / 1024 / 1024 if box_total_bytes else 0.0
+                box_mbps = (box_mb / box_upload_time) if box_upload_time else 0.0
+                metrics["Box upload speed mb/s"] = f"{box_mbps:.2f}"
+                metrics["Box total mb"] = f"{box_mb:.2f}"
                 transfer_status["box"] = f"SUCCESS ({', '.join(box_files)})"
                 for fname in box_files:
                     log_box_version(trace_id, fname, "box_id", "box_version")
+                log_file_transferred(trace_id, f"{len(box_files)} file(s)", "Box", box_upload_time, box_mbps)
             else:
                 warnings.append("No files matched FILE_PATTERN for Box, skipping Box upload.")
                 transfer_status["box"] = "NO FILES"
@@ -249,20 +271,19 @@ def lambda_handler(event, context):
         free_mb = shutil.disk_usage(tmp_dir).free // (1024 * 1024)
         log_tmp_usage(trace_id, len(os.listdir(tmp_dir)), free_mb)
 
+    # Send SNS Alert (metrics excluded per your request)
+    send_file_transfer_sns_alert(
+        trace_id=trace_id,
+        s3_files=[f for f in transfer_status.get("s3", "").replace("SUCCESS (", "").replace(")", "").split(", ") if f],
+        box_files=[f for f in transfer_status.get("box", "").replace("SUCCESS (", "").replace(")", "").split(", ") if f],
+        ftp_files=[f for f in transfer_status.get("ftp", "").replace("SUCCESS (", "").replace(")", "").split(", ") if f],
+        checksum_results=[{"file": k, "status": v} for k, v in checksum_status.items()],
+        errors=errors,
+        warnings=warnings,
+        function_name=function_name
+    )
+
     log_job_end(trace_id, job_id)
-
-    # SEND ALERT
-    if sns_topic_arn:
-        send_transfer_alert(
-            trace_id=trace_id,
-            sns_topic_arn=sns_topic_arn,
-            transfer_status=transfer_status,
-            checksum_results=checksum_results,
-            metrics=metrics,
-            errors=errors,
-            warnings=warnings
-        )
-
     return {
         'statusCode': 200,
         'body': json.dumps({'message': 'Files transferred successfully to all destinations.', 'trace_id': trace_id})

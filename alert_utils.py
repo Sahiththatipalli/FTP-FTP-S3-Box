@@ -1,67 +1,36 @@
-import boto3
 import os
+import boto3
 
 def send_file_transfer_sns_alert(
-    sns_topic_arn,
-    trace_id,
-    transfer_status,
-    checksum_status,
-    metrics,
-    errors,
-    warnings
+    trace_id, s3_files, box_files, ftp_files, checksum_results, errors=None, warnings=None, function_name="N/A"
 ):
-    sns = boto3.client("sns")
-    msg_lines = []
+    """
+    Compose and send an SNS alert about the transfer outcome.
+    """
+    sns_client = boto3.client("sns")
+    sns_topic_arn = os.getenv("SNS_TOPIC_ARN")
 
-    msg_lines.append("AWS Lambda File Transfer Alert")
-    msg_lines.append(f"Trace ID: {trace_id}\n")
+    body = f"""[ALERT] File Transfer Summary
+Function: {function_name}
+Trace ID: {trace_id}
 
-    msg_lines.append("==== Transfer Status ====")
-    for dest in ("s3", "ftp", "box"):
-        label = dest.upper()
-        stat = transfer_status.get(dest, "N/A")
-        msg_lines.append(f"- {label}: {stat}")
-    msg_lines.append("")
+Transferred to S3: {', '.join(s3_files) if s3_files else 'None'}
+Transferred to Box: {', '.join(box_files) if box_files else 'None'}
+Transferred to FTP: {', '.join(ftp_files) if ftp_files else 'None'}
 
-    msg_lines.append("==== Checksum Results ====")
-    for filename, status in checksum_status.items():
-        msg_lines.append(f"- {filename}: {status}")
-    if not checksum_status:
-        msg_lines.append("No checksum data available.")
-    msg_lines.append("")
+Checksums:
+""" + "\n".join([f"  {f['file']}: {f['status']}" for f in checksum_results])
 
-    msg_lines.append("==== Metrics ====")
-    for key, val in metrics.items():
-        msg_lines.append(f"- {key}: {val}")
-    if not metrics:
-        msg_lines.append("No metric data.")
-    msg_lines.append("")
-
-    if errors:
-        msg_lines.append("==== ERRORS ====")
-        for err in errors:
-            msg_lines.append(f"- {err}")
-        msg_lines.append("")
     if warnings:
-        msg_lines.append("==== WARNINGS ====")
-        for w in warnings:
-            msg_lines.append(f"- {w}")
-        msg_lines.append("")
-
-    msg_lines.append("Automated Lambda SNS Alert. See CloudWatch for full logs.\n")
-
-    message = "\n".join(msg_lines)
-    subject = f"Lambda File Transfer: Trace {trace_id} - "
+        body += "\nWarnings:\n" + "\n".join([str(w) for w in warnings])
     if errors:
-        subject += "ERROR"
-    else:
-        subject += "SUCCESS"
+        body += "\nErrors:\n" + "\n".join([str(e) for e in errors])
 
-    # Send SNS
     if sns_topic_arn:
-        sns.publish(
+        sns_client.publish(
             TopicArn=sns_topic_arn,
-            Subject=subject,
-            Message=message
+            Subject=f"File Transfer Alert (Trace ID: {trace_id})",
+            Message=body
         )
-
+    else:
+        print("[WARNING] SNS_TOPIC_ARN is not set. No alert sent.")
